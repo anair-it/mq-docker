@@ -1,0 +1,99 @@
+#!/bin/bash
+# -*- mode: sh -*-
+# © Copyright IBM Corporation 2015, 2016
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+set -e
+
+sysctl fs.file-max=524288
+echo "kernel.sem=500 256000 500 2048" >> /etc/sysctl.conf
+
+sysctl -p
+
+stop()
+{
+	endmqm $MQ_QMGR_NAME
+}
+
+config()
+{
+	: ${MQ_QMGR_NAME?"ERROR: You need to set the MQ_QMGR_NAME environment variable"}
+	source /opt/mqm/bin/setmqenv -s
+	echo "----------------------------------------"
+	dspmqver
+	echo "----------------------------------------"
+	mqconfig || (echo -e "\nERROR: mqconfig returned a non-zero return code" 1>&2 ; exit 1)
+	echo "----------------------------------------"
+
+	QMGR_EXISTS=`dspmq | grep ${MQ_QMGR_NAME} > /dev/null ; echo $?`
+	if [ ${QMGR_EXISTS} -ne 0 ]; then
+		echo "Checking filesystem..."
+		amqmfsck /var/mqm
+		echo "----------------------------------------"
+		crtmqm -q ${MQ_QMGR_NAME} || true
+		strmqm -e CMDLEVEL=${MQ_QMGR_CMDLEVEL} || true
+		echo "----------------------------------------"
+	fi
+	strmqm ${MQ_QMGR_NAME}
+	if [ ${QMGR_EXISTS} -ne 0 ]; then
+		echo "----------------------------------------"
+		if [ -f /etc/mqm/listener.mqsc ]; then
+			runmqsc ${MQ_QMGR_NAME} < /etc/mqm/listener.mqsc
+		fi
+		if [ -f /etc/mqm/config.mqsc ]; then
+			runmqsc ${MQ_QMGR_NAME} < /etc/mqm/config.mqsc
+		fi
+	fi
+	echo "----------------------------------------"
+}
+
+state()
+{
+	dspmq -n -m ${MQ_QMGR_NAME} | awk -F '[()]' '{ print $4 }'
+}
+
+monitor()
+{
+	# Loop until "dspmq" says the queue manager is running
+	until [ "`state`" == "RUNNING" ]; do
+		sleep 1
+	done
+	dspmq
+
+	# Loop until "dspmq" says the queue manager is not running any more
+	until [ "`state`" != "RUNNING" ]; do
+		sleep 5
+	done
+
+	# Wait until queue manager has ended before exiting
+	while true; do
+		STATE=`state`
+		case "$STATE" in
+			ENDED*) break;;
+			*) ;;
+		esac
+		sleep 1
+	done
+	dspmq
+}
+
+mq-license-check.sh
+# If /var/mqm is empty (because it's mounted from a new host volume), then populate it
+if [ ! "$(ls -A /var/mqm)" ]; then
+	/opt/mqm/bin/amqicdir -i -f
+fi
+config
+trap stop SIGTERM SIGINT
+monitor
+
